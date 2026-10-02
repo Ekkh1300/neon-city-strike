@@ -18,6 +18,8 @@ A **cyberpunk arena shooter** that fits in **one HTML file** — nothing to inst
 no internet required. The whole game (including the three.js engine and the PeerJS networking
 library) is inlined, and it makes no outbound requests.
 
+> **▶ [Play it in the browser](https://ekkh1300.github.io/neon-city-strike/)** — no install, no download
+
 ---
 
 ## Run it
