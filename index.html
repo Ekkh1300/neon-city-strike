@@ -2982,6 +2982,10 @@ var PEER_CFG = (function(){
   return opt;
 })();
 
+/* how hard we knock on a room before telling the player it is not there */
+var MAX_JOIN_TRIES = 6;
+var JOIN_RETRY_MS = 2000;
+
 var MP = {
   mode: 'solo',            // 'solo' | 'host' | 'client'
   peer: null,
@@ -2996,6 +3000,7 @@ var MP = {
   pingRate: 2,             // s — heartbeat
   peerTimeout: 8000,       // ms — no traffic for this long = dead
   inputTimeout: 300,       // ms — drop stale inputs on the host
+  joinState: 'idle',       // idle | joining | connected | joined | failed
   _sendAcc: 0,
   _pingAcc: 0,
   _interp: {},
@@ -3260,44 +3265,62 @@ function mpJoin(code){
   for(var k in PEER_CFG){ if(k!=='signalling') opts[k]=PEER_CFG[k]; }
   var peer=new Peer(null, opts);
   MP.peer=peer;
-  // the host may still be registering its id when we knock — retry instead of
-  // failing silently, which is what a late joiner used to hit
+  // the host may still be registering its id when we knock, and the public
+  // signalling server is rate limited — so retry instead of failing silently
   var tries=0, retryTimer=null;
+  MP.joinState='joining';
+  function say(txt){ setMpStatus(txt); }
+  function fail(txt){ MP.joinState='failed'; say(txt); }
+
   function attempt(){
     tries++;
     var conn=peer.connect('neonstrike-'+MP.roomCode);
     MP.hostConn=conn;
     MP.lastRecv=Date.now();
     conn.on('open',function(){
+      MP.joinState='connected';
       conn.send({t:'join', name:'PLAYER'});
-      setMpStatus('joined! waiting in lobby…');
+      say('connected — waiting in lobby…');
     });
     conn.on('data', function(d){ MP.lastRecv=Date.now(); clientOnData(d); });
     conn.on('error', function(err){
-      if(err.type==='peer-unavailable' && tries<4){
-        setMpStatus('waiting for the host… (try '+tries+')');
+      if(err.type==='peer-unavailable' && tries<MAX_JOIN_TRIES){
+        say('waiting for the host… (try '+tries+'/'+MAX_JOIN_TRIES+')');
         if(retryTimer) clearTimeout(retryTimer);
-        retryTimer=setTimeout(attempt, 1500);
+        retryTimer=setTimeout(attempt, JOIN_RETRY_MS);
         return;
       }
-      if(err.type==='peer-unavailable'){ setMpStatus('room not found'); return; }
+      if(err.type==='peer-unavailable'){
+        fail('room not found — check the code, or the free signalling server is busy. '+
+             'Try again in a moment, or self-host a PeerServer (see DEPLOY.md).');
+        return;
+      }
       mpClientLost('connection error');
     });
     conn.on('close', function(){
       if(retryTimer){ clearTimeout(retryTimer); retryTimer=null; }
       if(MP.joined){ mpClientLost('host left the room'); return; }
-      if(tries<4){ retryTimer=setTimeout(attempt, 1500); }
+      if(tries<MAX_JOIN_TRIES && MP.joinState==='joining'){
+        retryTimer=setTimeout(attempt, JOIN_RETRY_MS);
+      }
     });
   }
   peer.on('open', attempt);
   peer.on('error', function(err){
-    if(err.type==='peer-unavailable'){ setMpStatus('room not found'); return; }
-    setMpStatus('network error: '+err.type);
+    if(err.type==='peer-unavailable'){ fail('room not found — check the code.'); return; }
+    fail('cannot reach the signalling server ('+PEER_CFG.signalling+')');
   });
-  // no welcome within 12s => the room is not answering
+  // nothing at all after a while: explain *why*, and never talk over a retry
+  // that is still running or over a verdict that already landed
   MP.joinWatchdog=setTimeout(function(){
-    if(MP.mode==='client' && !MP.joined) setMpStatus('no answer from the room — check the code');
-  }, 12000);
+    MP.joinWatchdog=null;
+    if(MP.mode!=='client' || MP.joined) return;
+    if(MP.joinState==='failed') return;                 // a precise reason is shown
+    if(retryTimer) return;                              // still knocking, stay quiet
+    if(MP.joinState==='connected'){ say('connected — host is not starting yet'); return; }
+    say('still no answer from '+MP.roomCode+' — the host must keep this page open, '+
+        'and both players need internet.');
+  }, 18000);
 }
 
 /* host vanished: tell the player, then try to come back once */
@@ -3342,6 +3365,7 @@ function clientOnData(d){
   if(d.t==='welcome'){
     if(MP.joinWatchdog){ clearTimeout(MP.joinWatchdog); MP.joinWatchdog=null; }
     MP.joined=true;
+    MP.joinState='joined';
     MP.myId=d.yourId;
     MP.players[d.yourId]={id:d.yourId,weapon:'smg'};
     setMpStatus('joined as '+MP.names[d.yourId]+' · '+PEER_CFG.signalling);
