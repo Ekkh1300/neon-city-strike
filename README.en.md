@@ -87,5 +87,3 @@ preview.png  menu screenshot
 
 - Runs in any mobile browser and ships with full-screen support (`mobile-web-app-capable`)
 - Multiplayer uses the **PeerJS cloud**, so that mode does need an internet connection
-- The original file on my machine was named `neon-city-strike (7).html`; it is renamed to
-  `index.html` here so the repo and GitHub Pages stay clean
