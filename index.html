@@ -2645,7 +2645,7 @@ function setupInput(){
   if(mpBtn) mpBtn.addEventListener('click',function(){
     document.getElementById('startScreen').style.display='none';
     document.getElementById('mpLobbyScreen').style.display='flex';
-    setMpStatus('');
+    setMpStatus('signal: '+PEER_CFG.signalling);
   });
   var mpBack=document.getElementById('mpBackBtn');
   if(mpBack) mpBack.addEventListener('click',backToMenu);
@@ -2664,10 +2664,25 @@ function setupInput(){
   if(joinB) joinB.addEventListener('click',function(){
     mpJoin(document.getElementById('joinCodeInput').value);
   });
+  var joinInput=document.getElementById('joinCodeInput');
+  if(joinInput) joinInput.addEventListener('keydown',function(ev){
+    if(ev.key==='Enter'){ ev.preventDefault(); mpJoin(joinInput.value); }
+  });
   var hostStart=document.getElementById('hostStartBtn');
   if(hostStart) hostStart.addEventListener('click',function(){
     if(MP.mode==='host'){ mpHostStart(); }
   });
+
+  // deep link: index.html?room=ABCDE opens the lobby with the code filled in
+  try{
+    var qs=new URLSearchParams(location.search);
+    var room=(qs.get('room')||'').toUpperCase().trim();
+    if(room && mpBtn){
+      joinInput.value=room;
+      mpBtn.click();
+      setMpStatus('room '+room+' — press JOIN');
+    }
+  }catch(e){}
 }
 
 window.addEventListener('resize',function(){
@@ -2912,6 +2927,55 @@ window.addEventListener('DOMContentLoaded', init);
    interpolated remote state. Max 4 players per room.
    ============================================================ */
 
+/* ---------- deployment / signalling configuration ----------
+   Out of the box the game talks to the public PeerJS cloud (0.peerjs.com),
+   which is fine for a quick test but rate-limited and not meant for production.
+
+   Point it at your own PeerServer — without touching this file:
+     index.html?peerHost=peer.example.com&peerPort=443&peerPath=/&peerKey=peerjs&peerSecure=1
+   ICE servers (your own TURN is strongly recommended — peers behind symmetric
+   NAT will simply never connect without it):
+     index.html?stun=stun:my.stun:3478&turn=turn:my.turn:3478&turnUser=user&turnPass=pass
+   Or bake it in once, right above this block:
+     window.NCS_CONFIG = { host:'peer.example.com', port:443, path:'/', key:'peerjs',
+                           secure:true, turnUser:'user', turnPass:'pass',
+                           iceServers:[{urls:'turn:my.turn:3478',username:'user',credential:'pass'}] };
+*/
+var PEER_CFG = (function(){
+  var cfg = window.NCS_CONFIG || {};
+  var q = (function(){
+    try{ return new URLSearchParams(location.search); }catch(e){ return { get:function(){return null;} }; }
+  })();
+  function pick(key, alt){ var v=q.get(key); if(v!==null && v!=='') return v; return alt; }
+  var opt = {};
+  var host = pick('peerHost', cfg.host);
+  var port = pick('peerPort', cfg.port);
+  var path = pick('peerPath', cfg.path);
+  var key  = pick('peerKey',  cfg.key);
+  var sec  = pick('peerSecure', cfg.secure);
+  if(host) opt.host = host;
+  if(port) opt.port = Number(port);
+  if(path) opt.path = path;
+  if(key)  opt.key = key;
+  if(sec!==null && sec!==undefined && sec!=='') opt.secure = (sec==='1'||sec==='true'||sec===true);
+
+  var ice = (cfg.iceServers||[]).slice();
+  var stun = pick('stun', null);
+  var turn = pick('turn', null);
+  var tu   = pick('turnUser', cfg.turnUser);
+  var tp   = pick('turnPass', cfg.turnPass);
+  if(stun) ice.push({ urls:String(stun).split(',') });
+  if(turn){
+    String(turn).split(',').forEach(function(u){
+      u=u.trim(); if(u) ice.push({ urls:u, username:tu||'peerjsp', credential:tp||'peerjsp' });
+    });
+  }
+  if(ice.length) opt.config = { iceServers:ice, sdpSemantics:'unified-plan' };
+
+  opt.signalling = host ? (host + (path||'/')) : 'PeerJS cloud · 0.peerjs.com';
+  return opt;
+})();
+
 var MP = {
   mode: 'solo',            // 'solo' | 'host' | 'client'
   peer: null,
@@ -2923,8 +2987,15 @@ var MP = {
   colors: [0xff2fd6, 0x00eaff, 0xffe14d, 0x7cff4d],
   names: ['P1','P2','P3','P4'],
   tickRate: 20,
+  pingRate: 2,             // s — heartbeat
+  peerTimeout: 8000,       // ms — no traffic for this long = dead
+  inputTimeout: 300,       // ms — drop stale inputs on the host
   _sendAcc: 0,
+  _pingAcc: 0,
   _interp: {},
+  lastRecv: 0,
+  roomTries: 0,
+  rejoining: false,
   onPlayersChanged: null
 };
 
@@ -2961,53 +3032,110 @@ function mpUpdateLobby(){
 
 // ---------- HOST ----------
 function mpHost(){
+  if(MP.peer){ try{ MP.peer.destroy(); }catch(e){} MP.peer=null; }
   MP.mode='host';
-  MP.roomCode=mpGenCode();
   MP.myId=0;
+  MP.conns=[];
+  MP.roomTries=0;
+  MP.roomCode=mpGenCode();
   MP.players={0:{id:0,weapon:'smg'}};
   mpUpdateLobby();
   setMpStatus('creating room…');
-  var peer=new Peer('neonstrike-'+MP.roomCode, {debug:0});
+  mpHostAttempt();
+}
+
+function mpHostAttempt(){
+  var code=MP.roomCode;
+  var opts={debug:0};
+  for(var k in PEER_CFG){ if(k!=='signalling') opts[k]=PEER_CFG[k]; }
+  var peer=new Peer('neonstrike-'+code, opts);
   MP.peer=peer;
+  var settled=false;
+
   peer.on('open', function(){
+    settled=true;
     setMpStatus('room '+MP.roomCode+' — share the code!');
     mpUpdateLobby();
   });
+
   peer.on('connection', function(conn){
     if(MP.conns.length>=3){
-      conn.on('open',function(){ conn.send({t:'full'}); setTimeout(function(){conn.close();},500); });
+      conn.on('open',function(){ conn.send({t:'full'}); setTimeout(function(){ conn.close(); },500); });
       return;
     }
     MP.conns.push(conn);
+    conn.lastSeen=Date.now();
     conn.on('open', function(){
       // assign lowest free id
       var used=[0];
       for(var c=0;c<MP.conns.length;c++) if(MP.conns[c].mpId!==undefined) used.push(MP.conns[c].mpId);
       var id=1; while(used.indexOf(id)>=0) id++;
       conn.mpId=id;
+      conn.lastSeen=Date.now();
       MP.players[id]={id:id,weapon:'smg'};
       addRemotePlayer(id);            // host sees the client's avatar immediately
       conn.send({t:'welcome', yourId:id, code:MP.roomCode});
       broadcastLobby();
       if(MP.onPlayersChanged) MP.onPlayersChanged();
     });
-    conn.on('data', function(d){ hostOnData(conn,d); });
-    conn.on('close', function(){
-      MP.conns=MP.conns.filter(function(c){return c!==conn;});
-      if(conn.mpId!==undefined){ delete MP.players[conn.mpId]; removeRemotePlayer(conn.mpId); }
-      broadcastLobby();
-      if(MP.onPlayersChanged) MP.onPlayersChanged();
-    });
+    conn.on('data', function(d){ conn.lastSeen=Date.now(); hostOnData(conn,d); });
+    conn.on('close', function(){ mpDropConn(conn); });
+    conn.on('error', function(){ mpDropConn(conn); });
   });
+
   peer.on('error', function(err){
+    // a taken room code is the one failure we can simply retry
+    if(err.type==='unavailable-id' && !settled && MP.roomTries<3){
+      MP.roomTries++;
+      MP.roomCode=mpGenCode();
+      try{ peer.destroy(); }catch(e){}
+      if(MP.peer===peer) MP.peer=null;
+      setMpStatus('code taken — new code, retry…');
+      mpUpdateLobby();
+      mpHostAttempt();
+      return;
+    }
     var msg = err.type==='unavailable-id' ? 'code taken — try again' : 'network error: '+err.type;
     setMpStatus(msg);
   });
+
+  // if the signalling server never answers, fail loudly instead of hanging
+  setTimeout(function(){
+    if(!settled && MP.peer===peer && MP.mode==='host'){
+      setMpStatus('signalling unreachable ('+PEER_CFG.signalling+')');
+    }
+  }, 9000);
+}
+
+function mpDropConn(conn){
+  MP.conns=MP.conns.filter(function(c){return c!==conn;});
+  if(conn.mpId!==undefined){ delete MP.players[conn.mpId]; removeRemotePlayer(conn.mpId); }
+  broadcastLobby();
+  if(MP.onPlayersChanged) MP.onPlayersChanged();
+}
+
+/* heartbeat: kills ghost avatars when a client vanishes without a 'close' */
+function mpHostWatchdog(dt){
+  if(MP.mode!=='host' || !MP.conns.length) return;
+  MP._pingAcc+=dt;
+  var now=Date.now(), dead=[];
+  for(var c=0;c<MP.conns.length;c++){
+    var conn=MP.conns[c];
+    if(!conn.open || (now-(conn.lastSeen||now)>MP.peerTimeout)){ dead.push(conn); continue; }
+  }
+  for(var d=0;d<dead.length;d++){ try{ dead[d].close(); }catch(e){} mpDropConn(dead[d]); }
+  if(MP._pingAcc>=MP.pingRate){
+    MP._pingAcc=0;
+    for(var k=0;k<MP.conns.length;k++){
+      if(MP.conns[k].open){ try{ MP.conns[k].send({t:'ping', ts:Date.now()}); }catch(e){} }
+    }
+  }
 }
 
 function hostOnData(conn,d){
   if(!d || typeof d!=='object') return;
   if(conn.mpId===undefined) return;
+  if(d.t==='ping') return;                       // heartbeat, nothing to apply
   if(d.t==='join' && d.name){ MP.names[conn.mpId]=String(d.name).slice(0,10);
     var j=addRemotePlayer(conn.mpId); broadcastLobby(); }
   if(d.t==='weapon'){
@@ -3018,7 +3146,10 @@ function hostOnData(conn,d){
   if(d.t==='input'){
     if(!remotePlayers[conn.mpId]) addRemotePlayer(conn.mpId);
     var rp=remotePlayers[conn.mpId];
-    if(rp && G.started && !G.gameOver){
+    if(rp){
+      // inputs are a full snapshot, so a lost "release" packet would leave the
+      // host holding jump/fire forever — stamp them and expire stale ones
+      rp.inputAt=Date.now();
       rp.input.yaw=d.yaw; rp.input.pitch=d.pitch;
       rp.input.fwd=d.fwd; rp.input.strafe=d.strafe;
       rp.input.jump=d.jump; rp.input.sprint=d.sprint;
@@ -3111,29 +3242,68 @@ function broadcastState(){
 
 // ---------- CLIENT ----------
 function mpJoin(code){
+  if(MP.peer){ try{ MP.peer.destroy(); }catch(e){} MP.peer=null; }
   MP.mode='client';
+  MP.hostConn=null;
+  MP.joined=false;
+  MP.rejoining=false;
   MP.roomCode=(code||'').toUpperCase().trim();
   if(MP.roomCode.length<4){ setMpStatus('enter a valid code'); return; }
   setMpStatus('joining '+MP.roomCode+'…');
-  var peer=new Peer(null,{debug:0});
+  var opts={debug:0};
+  for(var k in PEER_CFG){ if(k!=='signalling') opts[k]=PEER_CFG[k]; }
+  var peer=new Peer(null, opts);
   MP.peer=peer;
   peer.on('open',function(){
-    var conn=peer.connect('neonstrike-'+MP.roomCode, {reliable:false});
+    // reliable on purpose: inputs are full snapshots, so a dropped "release"
+    // packet would leave the host holding jump/fire forever
+    var conn=peer.connect('neonstrike-'+MP.roomCode);
     MP.hostConn=conn;
+    MP.lastRecv=Date.now();
     conn.on('open',function(){
       conn.send({t:'join', name:'PLAYER'});
       setMpStatus('joined! waiting in lobby…');
     });
-    conn.on('data', clientOnData);
-    conn.on('close', function(){
-      setMpStatus('disconnected from host');
-      backToMenu();
-    });
+    conn.on('data', function(d){ MP.lastRecv=Date.now(); clientOnData(d); });
+    conn.on('close', function(){ mpClientLost('host left the room'); });
+    conn.on('error', function(){ mpClientLost('connection error'); });
   });
   peer.on('error', function(err){
-    var msg = (err.type==='peer-unavailable') ? 'room not found' : 'network error: '+err.type;
-    setMpStatus(msg);
+    if(err.type==='peer-unavailable'){ setMpStatus('room not found'); return; }
+    setMpStatus('network error: '+err.type);
   });
+  // no welcome within 12s => the room is not answering
+  MP.joinWatchdog=setTimeout(function(){
+    if(MP.mode==='client' && !MP.joined) setMpStatus('no answer from the room — check the code');
+  }, 12000);
+}
+
+/* host vanished: tell the player, then try to come back once */
+function mpClientLost(reason){
+  if(MP.mode!=='client') return;
+  setMpStatus(reason+' — reconnecting…');
+  var room=MP.roomCode;
+  if(MP.joinWatchdog){ clearTimeout(MP.joinWatchdog); MP.joinWatchdog=null; }
+  try{ if(MP.peer) MP.peer.destroy(); }catch(e){}
+  MP.peer=null; MP.hostConn=null;
+  if(MP.rejoining){ backToMenu(); return; }
+  MP.rejoining=true;
+  setTimeout(function(){
+    if(MP.mode==='client'){ backToMenu(); mpJoin(room); }
+  }, 2500);
+}
+
+/* client watchdog: silence longer than peerTimeout means the host is gone */
+function mpClientWatchdog(dt){
+  if(MP.mode!=='client') return;
+  var conn=MP.hostConn;
+  if(!conn || !conn.open || !G.started) return;
+  MP._pingAcc+=dt;
+  if(MP._pingAcc>=MP.pingRate){
+    MP._pingAcc=0;
+    try{ conn.send({t:'ping', ts:Date.now()}); }catch(e){}
+    if(Date.now()-MP.lastRecv>MP.peerTimeout) mpClientLost('host lost');
+  }
 }
 
 function showClientLobby(){
@@ -3145,11 +3315,14 @@ function showClientLobby(){
 
 function clientOnData(d){
   if(!d || typeof d!=='object') return;
-  if(d.t==='full'){ setMpStatus('room is full (4/4)'); MP.peer.destroy(); return; }
+  if(d.t==='ping') return;
+  if(d.t==='full'){ setMpStatus('room is full (4/4)'); try{ MP.peer.destroy(); }catch(e){} return; }
   if(d.t==='welcome'){
+    if(MP.joinWatchdog){ clearTimeout(MP.joinWatchdog); MP.joinWatchdog=null; }
+    MP.joined=true;
     MP.myId=d.yourId;
     MP.players[d.yourId]={id:d.yourId,weapon:'smg'};
-    setMpStatus('joined as '+MP.names[d.yourId]);
+    setMpStatus('joined as '+MP.names[d.yourId]+' · '+PEER_CFG.signalling);
     showClientLobby();
     return;
   }
@@ -3170,7 +3343,7 @@ function clientOnData(d){
     return;
   }
   if(d.t==='start'){
-    startMultiplayerRun();
+    startMultiplayerRun(false);
     return;
   }
   if(d.t==='youDied'){
@@ -3191,10 +3364,22 @@ function setMpStatus(txt){
   if(el) el.textContent=txt;
 }
 function backToMenu(){
+  // tear the peer down for real, otherwise the room stays registered on the
+  // signalling server and ghost players linger until the tab is closed
+  if(MP.joinWatchdog){ clearTimeout(MP.joinWatchdog); MP.joinWatchdog=null; }
+  try{ if(MP.peer) MP.peer.destroy(); }catch(e){}
+  MP.peer=null; MP.hostConn=null; MP.conns=[]; MP.joined=false; MP.rejoining=false;
+  for(var id in remotePlayers) removeRemotePlayer(parseInt(id));
+  MP.players={}; MP.mode='solo'; MP.roomCode='';
+  G.started=false;
   document.getElementById('hud').style.display='none';
+  document.getElementById('pauseScreen').style.display='none';
   document.getElementById('mpLobbyScreen').style.display='none';
   document.getElementById('weaponSelectScreen').style.display='none';
   document.getElementById('startScreen').style.display='flex';
+  var gate=document.getElementById('mpGestureGate');
+  if(gate && gate.parentNode) gate.parentNode.removeChild(gate);
+  if(document.pointerLockElement){ try{ document.exitPointerLock(); }catch(e){} }
 }
 // loadout picker lives inside the lobby: shift the weapon grid into the lobby panel
 function mountWeaponPickerInLobby(){
@@ -3268,12 +3453,17 @@ function removeRemotePlayer(id){
 function startRemoteReload(rp){ /* visual only — ammo tracked host-side */ }
 
 function updateRemotePlayers(dt){
+  var now=Date.now();
   for(var id in remotePlayers){
     var rp=remotePlayers[id];
     // HOST: drive avatars from the client's own inputs (real movement)
     if(MP.mode==='host' && rp.input && G.started && !G.gameOver && !rp.dead){
-      var inp=rp.input;
-      var yaw=inp.yaw||0;
+      // inputs are timestamped on arrival — a stale snapshot (client crashed,
+      // tab throttled, packet burst) must not keep walking the avatar
+      var fresh=(now-(rp.inputAt||0))<=MP.inputTimeout;
+      var inp=fresh?rp.input:{};
+      rp.aiming=fresh?!!inp.aim:false;
+      var yaw=inp.yaw||rp.yaw;
       var fx=-Math.sin(yaw), fz=-Math.cos(yaw);
       var sx=Math.cos(yaw),  sz=-Math.sin(yaw);
       var sp=MOVE_SPEED*((inp.sprint&&G.stamina>0)?SPRINT_MULT:1);
@@ -3283,9 +3473,26 @@ function updateRemotePlayers(dt){
       var nx=rp.x+mx*sp*dt, nz=rp.z+mz*sp*dt;
       if(!collidesAt(nx,rp.z)) rp.x=nx;
       if(!collidesAt(rp.x,nz)) rp.z=nz;
-      rp.groundY=groundHeightAt(rp.x,rp.z);
-      rp.tyaw=yaw; rp.aiming=!!inp.aim;
-    } else {
+      rp.tyaw=yaw;
+
+      // vertical: a small scripted hop so jumping reads correctly for others
+      if(inp.jump && rp.onGround!==false){ rp.vy=5.0; rp.onGround=false; }
+      rp.vy=(rp.vy||0)-15*dt;
+      rp.hop=(rp.hop||0)+rp.vy*dt;
+      if(rp.hop<=0){ rp.hop=0; rp.vy=0; rp.onGround=true; }
+      rp.sliding=!!inp.slide;
+
+      // muzzle flash + tracer when the remote pulls the trigger
+      var pulling=!!inp.fire;
+      rp.fireCd=Math.max(0,(rp.fireCd||0)-dt);
+      if(pulling && rp.fireCd<=0){
+        rp.fireCd=0.09;
+        var gpos=rp.group.position;
+        var dir=new THREE.Vector3(-Math.sin(rp.yaw),0,-Math.cos(rp.yaw));
+        var from=new THREE.Vector3(gpos.x, gpos.y+1.25+(rp.hop||0), gpos.z).addScaledVector(dir,0.45);
+        spawnTracer(from, from.clone().addScaledVector(dir,26));
+      }
+    } else if(MP.mode==='client'){
       // CLIENT: interpolate toward host snapshots
       rp.x += (rp.tx-rp.x)*Math.min(1,dt*12);
       rp.z += (rp.tz-rp.z)*Math.min(1,dt*12);
@@ -3293,15 +3500,16 @@ function updateRemotePlayers(dt){
     var dy=rp.tyaw-rp.yaw;
     rp.yaw += Math.atan2(Math.sin(dy),Math.cos(dy))*Math.min(1,dt*14);
 
-    rp.group.position.set(rp.x, rp.groundY||0, rp.z);
+    rp.group.position.set(rp.x, (rp.groundY||0)+(MP.mode==='host'?(rp.hop||0):0), rp.z);
     rp.group.rotation.y=rp.yaw;
+    rp.group.rotation.z=rp.sliding?-0.42:0;
     rp.group.visible=!rp.dead;
 
     // simple leg swing while moving
     var moved=(MP.mode==='host')
       ? Math.hypot((rp.input&&(rp.input.fwd||rp.input.strafe))?1:0,0)
       : Math.hypot(rp.tx-rp.x,rp.tz-rp.z);
-    if(MP.mode==='host'&&rp.input&&(rp.input.fwd||rp.input.strafe)) rp.walkPhase+=dt*9;
+    if(MP.mode==='host'&&rp.input&&rp.input.fwd&&(now-(rp.inputAt||0)<=MP.inputTimeout)) rp.walkPhase+=dt*9;
     else if(moved>0.01) rp.walkPhase+=dt*9;
     var sw=Math.sin(rp.walkPhase)*0.3;
     rp.group.children[3].rotation.x=sw;
@@ -3392,14 +3600,18 @@ function spawnPickupMirror(kind,x,z){
 
 // ---------- per-frame net tick ----------
 function netTick(dt){
-  if(MP.mode==='host' && G.started && !G.gameOver){
-    MP._sendAcc+=dt;
-    if(MP._sendAcc>=1/MP.tickRate){
-      MP._sendAcc=0;
-      if(MP.conns.length>0) broadcastState();
+  if(MP.mode==='host'){
+    mpHostWatchdog(dt);
+    if(G.started && !G.gameOver){
+      MP._sendAcc+=dt;
+      if(MP._sendAcc>=1/MP.tickRate){
+        MP._sendAcc=0;
+        if(MP.conns.length>0) broadcastState();
+      }
     }
     updateRemotePlayers(dt);
   } else if(MP.mode==='client'){
+    mpClientWatchdog(dt);
     MP._sendAcc+=dt;
     if(MP._sendAcc>=1/MP.tickRate && MP.hostConn && MP.hostConn.open && G.started && !G.gameOver){
       MP._sendAcc=0;
@@ -3407,14 +3619,16 @@ function netTick(dt){
       var k=G.keys;
       var fwd=(k['KeyW']||k['ArrowUp']?1:0)-(k['KeyS']||k['ArrowDown']?1:0);
       var str=(k['KeyD']||k['ArrowRight']?1:0)-(k['KeyA']||k['ArrowLeft']?1:0);
-      MP.hostConn.send({t:'input',
-        yaw:G.yawObj.rotation.y, pitch:G.pitchObj.rotation.x,
-        fwd:fwd, strafe:str,
-        jump:k['Space']?1:0,
-        sprint:(k['ShiftLeft']||k['ShiftRight'])?1:0,
-        slide:(k['ControlLeft']||k['ControlRight'])?1:0,
-        aim:G.aiming?1:0,
-        fire:G.mouseDown?1:0});
+      try{
+        MP.hostConn.send({t:'input',
+          yaw:G.yawObj.rotation.y, pitch:G.pitchObj.rotation.x,
+          fwd:fwd, strafe:str,
+          jump:k['Space']?1:0,
+          sprint:(k['ShiftLeft']||k['ShiftRight'])?1:0,
+          slide:(k['ControlLeft']||k['ControlRight'])?1:0,
+          aim:G.aiming?1:0,
+          fire:G.mouseDown?1:0});
+      }catch(e){ /* channel went away mid-frame — the watchdog handles cleanup */ }
     }
     updateRemotePlayers(dt);
     // client-side shooting is cosmetic+hit-request: raycast locally, tell host via damage intent?
@@ -3430,7 +3644,7 @@ function netSendShot(hitInfo){
 }
 
 // ---------- multiplayer run lifecycle ----------
-function startMultiplayerRun(){
+function startMultiplayerRun(fromGesture){
   // reset shared run state (both host & client)
   G.health=100; G.stamina=100; G.stamExhausted=false;
   G.score=0; G.kills=0; G.wave=1; G.waveBreak=3; G.timeAlive=0;
@@ -3453,8 +3667,59 @@ function startMultiplayerRun(){
   var et=document.getElementById('enemiesText');
   if(et) et.parentElement.style.display='none';
   G.started=true;
-  try{ G.renderer.domElement.requestPointerLock(); }catch(e){}
+  if(fromGesture){
+    mpEnterPlay();
+  } else {
+    // a client is told to start over the network — that is not a user gesture,
+    // so pointer lock and audio must wait for a click
+    mpGestureGate();
+  }
   updateHUD();
+}
+
+/* pointer lock + audio unlock, safe to call twice */
+function mpEnterPlay(){
+  try{ AudioSys.resume(); }catch(e){}
+  var el=G.renderer && G.renderer.domElement;
+  if(!el) return;
+  if(document.pointerLockElement===el) return;
+  try{
+    var p=el.requestPointerLock();
+    if(p && p.catch) p.catch(function(){});
+  }catch(e){}
+}
+
+/* overlay shown to clients whose run started from a network message */
+function mpGestureGate(){
+  var old=document.getElementById('mpGestureGate');
+  if(old && old.parentNode) old.parentNode.removeChild(old);
+  var box=document.createElement('div');
+  box.id='mpGestureGate';
+  box.style.cssText='position:fixed;inset:0;z-index:60;display:flex;align-items:center;'+
+    'justify-content:center;background:rgba(5,3,12,.82);backdrop-filter:blur(6px);'+
+    'cursor:pointer;text-align:center';
+  var inner=document.createElement('div');
+  inner.style.cssText='font-family:inherit;color:#eaffff';
+  var title=document.createElement('div');
+  title.textContent='CLICK TO PLAY';
+  title.style.cssText='font-size:30px;font-weight:800;letter-spacing:8px;color:#00eaff;'+
+    'text-shadow:0 0 18px rgba(0,234,255,.8)';
+  var sub=document.createElement('div');
+  sub.textContent='the round has started — click to aim and shoot';
+  sub.style.cssText='margin-top:14px;font-size:13px;letter-spacing:3px;color:#8fa8c8';
+  inner.appendChild(title); inner.appendChild(sub);
+  box.appendChild(inner);
+  document.body.appendChild(box);
+  var go=function(){
+    G.paused=false;
+    var ps=document.getElementById('pauseScreen');
+    if(ps) ps.style.display='none';
+    mpEnterPlay();
+    if(box.parentNode) box.parentNode.removeChild(box);
+  };
+  box.addEventListener('click',go);
+  box.addEventListener('touchstart',go,{passive:true});
+  window.__mpGateReady=go;
 }
 
 // host presses START in lobby: kick off locally + tell clients
@@ -3463,7 +3728,7 @@ function mpHostStart(){
   for(var c=0;c<MP.conns.length;c++){
     if(MP.conns[c].open) MP.conns[c].send({t:'start'});
   }
-  startMultiplayerRun();
+  startMultiplayerRun(true);
 }
 
 </script>

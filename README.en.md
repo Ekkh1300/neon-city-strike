@@ -20,6 +20,8 @@ library) is inlined, and it makes no outbound requests.
 
 > **▶ [Play it in the browser](https://ekkh1300.github.io/neon-city-strike/)** — no install, no download
 
+> **📡 [Deployment guide](DEPLOY.en.md) · [راهنمای فارسی](DEPLOY.md)** — HTTPS, static hosts, a PeerJS signalling server and TURN
+
 ---
 
 ## Run it
@@ -49,6 +51,13 @@ python -m http.server 8000
   | `LONGSHOT-50` | 110 | 5 | 250 | Long-range one-taps, 24° zoom |
 
 - **Two modes** — `SOLO PLAY` and `MULTIPLAYER` with create/join room (room code)
+- **Multiplayer rebuilt for a real server**
+  - Configurable signalling server (PeerJS Cloud by default) via URL parameters or `window.NCS_CONFIG`
+  - **Reliable** input channel plus host-side expiry of stale inputs (a lost input can no longer leave a player stuck walking)
+  - 2-second heartbeat, so a dropped client is cleaned up automatically (no ghost avatars)
+  - Automatic client reconnect, automatic retry on a taken room code, and a real peer teardown on exit
+  - A "click to play" gate for clients, because browsers refuse Pointer Lock without a user gesture
+  - Other players' jumps, slides and shots are simulated on the host
 - **Simulated movement** — sprinting with **stamina**, jumping, and sliding
 - **Tactical HUD** — health, stamina, ammo + reserve, reload bar, hitmarker, dynamic crosshair
 - **Weapon select on every respawn** (`CHOOSE YOUR WEAPON`), plus score, time, kills and death screen
