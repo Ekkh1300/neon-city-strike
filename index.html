@@ -605,14 +605,16 @@ function buildWorld(){
   }
   scene.background = new THREE.Color(0x0a0616);
 
-  scene.add(new THREE.AmbientLight(0x33224d, 0.9));
-  scene.add(new THREE.HemisphereLight(0x4433aa, 0x110a22, 0.7));
-  var moon = new THREE.DirectionalLight(0x8899ff, 0.35);
+  // three.js r155+ uses physically correct light units: ambient/hemisphere/directional
+  // are unaffected, but anything below used to be lit almost black
+  scene.add(new THREE.AmbientLight(0x3a2a5c, 1.15));
+  scene.add(new THREE.HemisphereLight(0x4a3ab5, 0x1a1030, 0.9));
+  var moon = new THREE.DirectionalLight(0x8899ff, 0.55);
   moon.position.set(-40, 80, -30);
   scene.add(moon);
 
   var groundMat = new THREE.MeshStandardMaterial({
-    color: 0x0d0d18, roughness: 0.92, metalness: 0.15
+    color: 0x16162b, roughness: 0.9, metalness: 0.08
   });
   var ground = new THREE.Mesh(new THREE.PlaneGeometry(140, 140), groundMat);
   ground.rotation.x = -Math.PI/2;
@@ -1216,7 +1218,8 @@ function makeEnemyMesh(tier){
   if(tier==='heavy'){
     // dynamic point lights are expensive on mobile GPUs — emissive trim carries the glow there
     if(!window.__MOBILE_PERF){
-      var pl = new THREE.PointLight(palette.glow, 0.8, 8);
+      // point lights are in candela since r155 — 0.8 lit nothing at all
+      var pl = new THREE.PointLight(palette.glow, 9, 9, 2);
       pl.position.y = 1.6*scale;
       grp.add(pl);
     }
@@ -2762,6 +2765,9 @@ function animate(){
   requestAnimationFrame(animate);
   var dt = Math.min(G.clock.getDelta(), 0.05);
   if(!G.started || G.paused || G.gameOver){
+    // the run is stopped, but remote players must keep breathing — otherwise they
+    // freeze mid-stride in the lobby and whenever the host pauses
+    if(MP.mode!=='solo') netTickIdle(dt);
     G.renderer.render(G.scene, G.camera);
     return;
   }
@@ -3137,7 +3143,7 @@ function hostOnData(conn,d){
   if(conn.mpId===undefined) return;
   if(d.t==='ping') return;                       // heartbeat, nothing to apply
   if(d.t==='join' && d.name){ MP.names[conn.mpId]=String(d.name).slice(0,10);
-    var j=addRemotePlayer(conn.mpId); broadcastLobby(); }
+    var j=addRemotePlayer(conn.mpId); drawAvatarTag(j); broadcastLobby(); }
   if(d.t==='weapon'){
     if(MP.players[conn.mpId]){ MP.players[conn.mpId].weapon=d.wpn; }
     var rw=remotePlayers[conn.mpId]; if(rw) rw.weapon=d.wpn;
@@ -3254,9 +3260,11 @@ function mpJoin(code){
   for(var k in PEER_CFG){ if(k!=='signalling') opts[k]=PEER_CFG[k]; }
   var peer=new Peer(null, opts);
   MP.peer=peer;
-  peer.on('open',function(){
-    // reliable on purpose: inputs are full snapshots, so a dropped "release"
-    // packet would leave the host holding jump/fire forever
+  // the host may still be registering its id when we knock — retry instead of
+  // failing silently, which is what a late joiner used to hit
+  var tries=0, retryTimer=null;
+  function attempt(){
+    tries++;
     var conn=peer.connect('neonstrike-'+MP.roomCode);
     MP.hostConn=conn;
     MP.lastRecv=Date.now();
@@ -3265,9 +3273,23 @@ function mpJoin(code){
       setMpStatus('joined! waiting in lobby…');
     });
     conn.on('data', function(d){ MP.lastRecv=Date.now(); clientOnData(d); });
-    conn.on('close', function(){ mpClientLost('host left the room'); });
-    conn.on('error', function(){ mpClientLost('connection error'); });
-  });
+    conn.on('error', function(err){
+      if(err.type==='peer-unavailable' && tries<4){
+        setMpStatus('waiting for the host… (try '+tries+')');
+        if(retryTimer) clearTimeout(retryTimer);
+        retryTimer=setTimeout(attempt, 1500);
+        return;
+      }
+      if(err.type==='peer-unavailable'){ setMpStatus('room not found'); return; }
+      mpClientLost('connection error');
+    });
+    conn.on('close', function(){
+      if(retryTimer){ clearTimeout(retryTimer); retryTimer=null; }
+      if(MP.joined){ mpClientLost('host left the room'); return; }
+      if(tries<4){ retryTimer=setTimeout(attempt, 1500); }
+    });
+  }
+  peer.on('open', attempt);
   peer.on('error', function(err){
     if(err.type==='peer-unavailable'){ setMpStatus('room not found'); return; }
     setMpStatus('network error: '+err.type);
@@ -3393,7 +3415,12 @@ var remotePlayers={};   // id -> {group, parts, x,z,yaw,hp,...}
 
 function makeAvatarMesh(colorHex){
   var grp=new THREE.Group();
-  var mat=new THREE.MeshStandardMaterial({color:0x20203a,roughness:0.55,metalness:0.3});
+  // was 0x20203a with no emissive: in a scene lit by ambient 0.9 the body turned
+  // into a black silhouette, which is why the host could not see other players
+  var mat=new THREE.MeshStandardMaterial({
+    color:0x33334f, roughness:0.5, metalness:0.2,
+    emissive:colorHex, emissiveIntensity:0.22
+  });
   var glow=new THREE.MeshBasicMaterial({color:colorHex});
   var torso=new THREE.Mesh(new THREE.BoxGeometry(0.7,0.95,0.42),mat);
   torso.position.y=1.15; grp.add(torso);
@@ -3411,36 +3438,62 @@ function makeAvatarMesh(colorHex){
   function box2(w,h,d,m,x,y){ var b=new THREE.Mesh(new THREE.BoxGeometry(w,h,d),m); b.position.set(x,y,0); return b; }
   // overhead marker
   var cv=document.createElement('canvas');
-  cv.width=128;cv.height=32;
+  cv.width=256;cv.height=64;
   var cx=cv.getContext('2d');
-  cx.font='bold 22px monospace';cx.textAlign='center';
-  cx.fillStyle='#'+('00000'+colorHex.toString(16)).slice(-6);
-  sceneReadyTag(cx);
+  cx.textAlign='center';
+  grp.userData.tagCtx=cx; grp.userData.tagCanvas=cv;
   var tagTex=new THREE.CanvasTexture(cv);
   var tag=new THREE.Sprite(new THREE.SpriteMaterial({map:tagTex,transparent:true,depthTest:false}));
-  tag.scale.set(1.6,0.4,1); tag.position.y=2.35;
+  tag.scale.set(2.2,0.55,1); tag.position.y=2.45;
   grp.add(tag);
-  grp.userData.tagCtx=cx; grp.userData.tagCanvas=cv; grp.userData.tagTex=tagTex;
+  grp.userData.tagTex=tagTex;
+
+  /* --- everything below is appended so children[3],[4],[6] stay the limbs --- */
+  // glowing chest strip, readable from any angle
+  var strip=new THREE.Mesh(new THREE.BoxGeometry(0.5,0.09,0.06),glow);
+  strip.position.set(0,1.28,-0.22); grp.add(strip);
+  // ground ring: guarantees the player is findable on a dark floor
+  var ring=new THREE.Mesh(
+    new THREE.RingGeometry(0.52,0.78,36),
+    new THREE.MeshBasicMaterial({color:colorHex,transparent:true,opacity:0.8,
+      side:THREE.DoubleSide,depthWrite:false})
+  );
+  ring.rotation.x=-Math.PI/2; ring.position.y=0.03;
+  grp.add(ring); grp.userData.ring=ring;
+  // a real light, so the avatar is lit and tints the ground around it
+  var lamp=new THREE.PointLight(colorHex, 7, 8, 2);
+  lamp.position.y=1.5; grp.add(lamp); grp.userData.lamp=lamp;
   return grp;
 }
-function sceneReadyTag(cx){ /* label filled later by updateRemoteTags */ }
+/* name plate with a dark backing so it reads over any background */
+function drawAvatarTag(rp){
+  var g=rp.group; if(!g||!g.userData.tagCtx) return;
+  var ctx=g.userData.tagCtx, cv=g.userData.tagCanvas;
+  ctx.clearRect(0,0,cv.width,cv.height);
+  ctx.fillStyle='rgba(6,4,16,0.72)';
+  if(ctx.roundRect){ ctx.beginPath(); ctx.roundRect(28,10,200,44,10); ctx.fill(); }
+  else { ctx.fillRect(28,10,200,44); }
+  var hex='#'+('00000'+(MP.colors[rp.id]||0xffffff).toString(16)).slice(-6);
+  ctx.font='bold 26px monospace';
+  ctx.textAlign='center';
+  ctx.fillStyle=hex;
+  ctx.fillText((MP.names[rp.id]||('P'+(rp.id+1))), 128, 42);
+  if(g.userData.tagTex) g.userData.tagTex.needsUpdate=true;
+}
 
 function addRemotePlayer(id){
   if(remotePlayers[id]) return remotePlayers[id];
   var colorHex=MP.colors[id]||0xffffff;
   var grp=makeAvatarMesh(colorHex);
-  // draw name once known
-  var ctx=grp.userData.tagCtx;
-  ctx.clearRect(0,0,128,32);
-  ctx.fillStyle='#'+('00000'+colorHex.toString(16)).slice(-6);
-  ctx.fillText(MP.names[id]||('P'+(id+1)),64,24);
-  grp.userData.tagTex.needsUpdate=true;
-  G.scene.add(grp);
-  remotePlayers[id]={
-    group:grp, x:0,z:0, tx:0,tz:0, yaw:0,tyaw:0, hp:100, weapon:'smg',
-    input:{}, sliding:false, aiming:false, dead:false, walkPhase:0, lastY:0
+  var rp={
+    id:id, group:grp, x:0,z:0, tx:0,tz:0, yaw:0,tyaw:0, hp:100, weapon:'smg',
+    input:{}, inputAt:0, sliding:false, aiming:false, dead:false,
+    walkPhase:0, lastY:0, hop:0, vy:0, onGround:true, fireCd:0, groundY:0
   };
-  return remotePlayers[id];
+  drawAvatarTag(rp);
+  G.scene.add(grp);
+  remotePlayers[id]=rp;
+  return rp;
 }
 
 function removeRemotePlayer(id){
@@ -3473,6 +3526,7 @@ function updateRemotePlayers(dt){
       var nx=rp.x+mx*sp*dt, nz=rp.z+mz*sp*dt;
       if(!collidesAt(nx,rp.z)) rp.x=nx;
       if(!collidesAt(rp.x,nz)) rp.z=nz;
+      rp.groundY=groundHeightAt(rp.x,rp.z);
       rp.tyaw=yaw;
 
       // vertical: a small scripted hop so jumping reads correctly for others
@@ -3517,6 +3571,14 @@ function updateRemotePlayers(dt){
 
     // aim pose: raise right arm
     rp.group.children[6].rotation.x = rp.aiming? -1.35 : 0;
+
+    // ground ring pulse keeps a remote player findable in a dark street
+    var ring=rp.group.userData.ring;
+    if(ring){
+      var s=1+Math.sin((now/420)+rp.id)*0.09;
+      ring.scale.set(s,s,1);
+      ring.material.opacity = rp.dead?0.15:0.55+Math.sin((now/300)+rp.id)*0.2;
+    }
   }
 }
 
@@ -3596,6 +3658,13 @@ function spawnPickupMirror(kind,x,z){
   grp.position.set(x,0.8,z);
   G.scene.add(grp);
   G.pickups.push({m:grp,type:kind,t:Math.random()*6,mirror:true});
+}
+
+// network upkeep when the local run is not simulating (lobby / paused / dead)
+function netTickIdle(dt){
+  if(MP.mode==='host') mpHostWatchdog(dt);
+  else if(MP.mode==='client') mpClientWatchdog(dt);
+  updateRemotePlayers(dt);
 }
 
 // ---------- per-frame net tick ----------
