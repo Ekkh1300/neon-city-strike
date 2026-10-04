@@ -20,7 +20,8 @@ library) is inlined, and it makes no outbound requests.
 
 > **▶ [Play it in the browser](https://ekkh1300.github.io/neon-city-strike/)** — no install, no download
 
-> **📡 [Deployment guide](DEPLOY.en.md) · [راهنمای فارسی](DEPLOY.md)** — HTTPS, static hosts, a PeerJS signalling server and TURN
+> **📡 [Deployment guide](DEPLOY.en.md) · [راهنمای فارسی](DEPLOY.md)** — HTTPS, static hosts, a PeerJS signalling server
+> **📶 [TURN for mobile networks](TURN.en.md) · [راهنمای فارسی](TURN.md)** — if it won't connect on a phone, read this (3 minutes with Docker)
 
 ---
 

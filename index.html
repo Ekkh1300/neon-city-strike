@@ -2976,7 +2976,16 @@ var PEER_CFG = (function(){
       u=u.trim(); if(u) ice.push({ urls:u, username:tu||'peerjsp', credential:tp||'peerjsp' });
     });
   }
-  if(ice.length) opt.config = { iceServers:ice, sdpSemantics:'unified-plan' };
+  if(!ice.length){
+    // PeerJS's bundled TURN relays (turn.peerjs.com) are gone/unreliable, and
+    // its default config replaces rather than extends ours — so ship two healthy
+    // STUN servers. This is enough for most home networks, but a phone on a
+    // carrier network (symmetric NAT) still needs a real TURN relay.
+    ice=[{ urls:['stun:stun.l.google.com:19302',
+                 'stun:stun1.l.google.com:19302',
+                 'stun:stun.cloudflare.com:3478'] }];
+  }
+  opt.config = { iceServers:ice, sdpSemantics:'unified-plan' };
 
   opt.signalling = host ? (host + (path||'/')) : 'PeerJS cloud · 0.peerjs.com';
   return opt;
@@ -3267,7 +3276,8 @@ function mpJoin(code){
   MP.peer=peer;
   // the host may still be registering its id when we knock, and the public
   // signalling server is rate limited — so retry instead of failing silently
-  var tries=0, retryTimer=null;
+  var tries=0, retryTimer=null, connTimer=null;
+  if(MP.joinWatchdog){ clearTimeout(MP.joinWatchdog); MP.joinWatchdog=null; }
   MP.joinState='joining';
   function say(txt){ setMpStatus(txt); }
   function fail(txt){ MP.joinState='failed'; say(txt); }
@@ -3277,16 +3287,18 @@ function mpJoin(code){
     var conn=peer.connect('neonstrike-'+MP.roomCode);
     MP.hostConn=conn;
     MP.lastRecv=Date.now();
+    if(connTimer){ clearTimeout(connTimer); connTimer=null; }
     conn.on('open',function(){
       MP.joinState='connected';
+      if(connTimer){ clearTimeout(connTimer); connTimer=null; }
       conn.send({t:'join', name:'PLAYER'});
       say('connected — waiting in lobby…');
     });
     conn.on('data', function(d){ MP.lastRecv=Date.now(); clientOnData(d); });
     conn.on('error', function(err){
+      if(retryTimer){ clearTimeout(retryTimer); retryTimer=null; }
       if(err.type==='peer-unavailable' && tries<MAX_JOIN_TRIES){
         say('waiting for the host… (try '+tries+'/'+MAX_JOIN_TRIES+')');
-        if(retryTimer) clearTimeout(retryTimer);
         retryTimer=setTimeout(attempt, JOIN_RETRY_MS);
         return;
       }
@@ -3295,15 +3307,39 @@ function mpJoin(code){
              'Try again in a moment, or self-host a PeerServer (see DEPLOY.md).');
         return;
       }
+      if(/ice|network|socket|connection/.test(err.type||'')){
+        // signalling works, the direct path does not: this is NAT, not a bad code
+        fail('signalling OK but the direct connection failed ('+err.type+'). '+
+             'Your network hides your device — a TURN server is required. '+
+             'See the TURN section in DEPLOY.md.');
+        return;
+      }
       mpClientLost('connection error');
     });
     conn.on('close', function(){
       if(retryTimer){ clearTimeout(retryTimer); retryTimer=null; }
+      if(connTimer){ clearTimeout(connTimer); connTimer=null; }
       if(MP.joined){ mpClientLost('host left the room'); return; }
       if(tries<MAX_JOIN_TRIES && MP.joinState==='joining'){
         retryTimer=setTimeout(attempt, JOIN_RETRY_MS);
       }
     });
+    // the channel can hang forever while ICE fails — bound it and say why
+    connTimer=setTimeout(function(){
+      if(conn.open || MP.joined) return;
+      if(MP.joinState==='failed') return;
+      if(tries<MAX_JOIN_TRIES){
+        say('direct connection stuck (ICE) — retrying '+tries+'/'+MAX_JOIN_TRIES+
+            (tries>1?' · this network likely needs TURN':''));
+        try{ conn.close(); }catch(e){}
+        retryTimer=setTimeout(attempt, JOIN_RETRY_MS);
+      } else {
+        fail('could not open a direct connection after '+tries+' tries. '+
+             'Your network hides this device — a TURN server is required. '+
+             'See the TURN section in DEPLOY.md.');
+      }
+    }, 12000);
+    MP.connTimer=connTimer;
   }
   peer.on('open', attempt);
   peer.on('error', function(err){
@@ -3329,6 +3365,7 @@ function mpClientLost(reason){
   setMpStatus(reason+' — reconnecting…');
   var room=MP.roomCode;
   if(MP.joinWatchdog){ clearTimeout(MP.joinWatchdog); MP.joinWatchdog=null; }
+  if(MP.connTimer){ clearTimeout(MP.connTimer); MP.connTimer=null; }
   try{ if(MP.peer) MP.peer.destroy(); }catch(e){}
   MP.peer=null; MP.hostConn=null;
   if(MP.rejoining){ backToMenu(); return; }

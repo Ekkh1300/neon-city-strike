@@ -20,7 +20,8 @@
 
 > **▶ [بازی مستقیم در مرورگر](https://ekkh1300.github.io/neon-city-strike/)** — بدون نصب، بدون دانلود
 
-> **📡 [راهنمای انتشار روی سرور](DEPLOY.md) · [Deploy guide](DEPLOY.en.md)** — HTTPS، هاست استاتیک، سرور سیگنالینگ PeerJS و TURN
+> **📡 [راهنمای انتشار روی سرور](DEPLOY.md) · [Deploy guide](DEPLOY.en.md)** — HTTPS، هاست استاتیک، سرور سیگنالینگ PeerJS
+> **📶 [TURN برای اینترنت موبایل](TURN.md) · [TURN guide](TURN.en.md)** — اگر روی گوشی وصل نمی‌شود، این را بخوان (۳ دقیقه با Docker)
 
 ---
 
