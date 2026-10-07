@@ -1,0 +1,77 @@
+services:
+  # ---------------------------------------------------------------- signalling
+  # PeerJS only introduces the two players to each other; game traffic is
+  # peer-to-peer. It MUST run behind a reverse proxy with --proxied, otherwise
+  # its IP based rate limiting breaks.
+  peerjs:
+    image: peerjs/peerjs-server:latest
+    container_name: neon-peerjs
+    restart: unless-stopped
+    command: >
+      --port 9000
+      --path /peerjs
+      --key ${PEERJS_KEY}
+      --proxied true
+      --expire_timeout 30000
+      --alive_timeout 180000
+      --concurrent_limit 2000
+    environment:
+      - PEERJS_KEY=${PEERJS_KEY}
+    ports:
+      - "127.0.0.1:9000:9000"   # only nginx needs to reach it
+
+  # -------------------------------------------------------------------- TURN
+  # Without TURN, two phones on mobile data can never connect (symmetric NAT).
+  # network_mode: host lets coturn bind 3478 directly instead of publishing it.
+  coturn:
+    image: coturn/coturn:latest
+    container_name: neon-coturn
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
+    command: ["-c", "/etc/coturn/turnserver.conf", "--log-file=stdout"]
+
+  # -------------------------------------------------------------------- game
+  # nginx serves index.html over HTTPS and proxies /peerjs -> PeerJS as wss://
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: neon-nginx
+    restart: unless-stopped
+    depends_on:
+      - peerjs
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./game:/usr/share/nginx/html:ro
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./certs:/etc/letsencrypt:ro
+      - certbot_out:/var/www/certbot:ro
+    command: >
+      /bin/sh -c "sleep 5;
+      while true; do
+        if [ ! -f /etc/letsencrypt/fullchain.pem ]; then
+          echo '>>> no certificate yet, asking certbot';
+          certbot certonly --webroot -w /var/www/certbot
+            -d ${GAME_DOMAIN}
+            --email ${LETSENCRYPT_EMAIL}
+            --agree-tos --no-eff-email --non-interactive || true;
+        fi;
+        nginx -g 'daemon off;' & NGINX_PID=\$!;
+        sleep 5;
+        kill -TERM \$NGINX_PID 2>/dev/null || true;
+        wait \$NGINX_PID || true;
+        sleep 5;
+      done"
+
+  certbot:
+    image: certbot/certbot:latest
+    container_name: neon-certbot
+    restart: unless-stopped
+    volumes:
+      - ./certs:/etc/letsencrypt
+      - certbot_out:/var/www/certbot
+
+volumes:
+  certbot_out:

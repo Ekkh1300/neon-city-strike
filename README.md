@@ -22,6 +22,7 @@
 
 > **📡 [راهنمای انتشار روی سرور](DEPLOY.md) · [Deploy guide](DEPLOY.en.md)** — HTTPS، هاست استاتیک، سرور سیگنالینگ PeerJS
 > **📶 [TURN برای اینترنت موبایل](TURN.md) · [TURN guide](TURN.en.md)** — اگر روی گوشی وصل نمی‌شود، این را بخوان (۳ دقیقه با Docker)
+> **🖥️ [سرور شخصی آماده](SERVER.md) · [Personal server](SERVER.en.md)** — پوشه‌ی `server/` + `sudo bash setup.sh`، همه‌چیز خودکار
 
 ---
 
