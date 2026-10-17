@@ -20,10 +20,14 @@
   /* ---------- HUD ---------- */
   #hud { position:fixed; inset:0; pointer-events:none; z-index:10; display:none; }
 
-  #crosshair { position:absolute; left:50%; top:50%; transform:translate(-50%,-50%); }
+  #crosshair { position:absolute; left:50%; top:50%; transform:translate(-50%,-50%);
+    transition:opacity .1s; }
+  #crosshair.hide { opacity:0; }
   #crosshair .dot { position:absolute; left:-2px; top:-2px; width:4px;height:4px;border-radius:50%;
     background:#00eaff; box-shadow:0 0 6px #00eaff; }
-  #crosshair .l { position:absolute; background:#00eaff; box-shadow:0 0 5px #00eaff; transition:all .08s; }
+  /* four ticks around the dot; JS only moves them (transform) so they animate */
+  #crosshair .l { position:absolute; left:0; top:0; background:#00eaff; box-shadow:0 0 5px #00eaff;
+    transition:transform .08s linear; }
   #aimDot { position:absolute; left:50%; top:50%; transform:translate(-50%,-50%);
     width:5px; height:5px; border-radius:50%; background:#fff;
     box-shadow:0 0 8px #ff2fd6, 0 0 2px #fff; opacity:0; transition:opacity .12s; }
@@ -116,7 +120,9 @@
   #pauseScreen { display:none; }
   .goTitle { font-size:56px; font-weight:900; letter-spacing:10px; color:#ff3860;
     text-shadow:0 0 30px #ff3860; margin-bottom:26px; }
-  .goStats { display:flex; gap:44px; margin-bottom:38px; }
+  .goStats { display:flex; gap:44px; margin-bottom:34px; }
+  .goBtns { display:flex; gap:16px; flex-wrap:wrap; justify-content:center; }
+  .goBtns .btn { padding:13px 40px; font-size:17px; }
   .goStat { text-align:center; }
   .goStat .v { font-size:36px; font-weight:800; color:#00eaff; text-shadow:0 0 14px #00eaff; }
   .goStat .k { font-size:12px; letter-spacing:3px; color:#9fb4d8; margin-top:4px; }
@@ -392,6 +398,7 @@
 <div id="pauseScreen" class="screen">
   <div class="title" style="font-size:42px;">PAUSED</div>
   <button class="btn" id="resumeBtn">RESUME</button>
+  <button class="btn" id="pauseMenuBtn" style="margin-top:14px;padding:10px 34px;font-size:14px;background:rgba(255,255,255,0.1);color:#dfe9ff;box-shadow:none;">MAIN MENU</button>
 </div>
 
 <div id="gameOverScreen" class="screen">
@@ -401,6 +408,10 @@
     <div class="goStat"><div class="v" id="finalWave">1</div><div class="k">WAVE</div></div>
     <div class="goStat"><div class="v" id="finalKills">0</div><div class="k">KILLS</div></div>
     <div class="goStat"><div class="v" id="finalTime">0:00</div><div class="k">TIME</div></div>
+  </div>
+  <div class="goBtns">
+    <button class="btn" id="goRedeployBtn">REDEPLOY ▶</button>
+    <button class="btn" id="goMenuBtn" style="background:rgba(255,255,255,0.1);color:#dfe9ff;box-shadow:0 0 20px rgba(255,255,255,0.15);">MAIN MENU</button>
   </div>
 </div>
 
@@ -780,9 +791,11 @@ function buildWorld(){
     hgrad.addColorStop(1,'rgba(255,223,143,0)');
     hctx.fillStyle=hgrad;hctx.fillRect(0,0,64,64);
     var halo=new THREE.Sprite(new THREE.SpriteMaterial({
-      map:new THREE.CanvasTexture(haloC),transparent:true,opacity:0.4,depthTest:false}));
+      map:new THREE.CanvasTexture(haloC),transparent:true,opacity:0.4,
+      depthTest:true, depthWrite:false}));
     halo.scale.set(2.6,2.6,1);
     halo.position.copy(head.position);
+    halo.position.y-=0.3;   // sit below the lamp head so the head never eats the glow
     grp.add(halo);
     grp.position.set(px,0,pz);
     grp.rotation.y=rotY||0;
@@ -1148,6 +1161,16 @@ function buildGun(){
   for(var k in G.gunModels) G.gunModels[k].visible=false;
   G.camera.add(g);
   g.position.set(0.22, -0.2, -0.45);
+
+  // viewmodel key light: the gun is dark metal under a purple night sky, so
+  // without this it rendered as a black silhouette. Short range so it only
+  // lights the weapon and the ground right in front of you.
+  if(!window.__MOBILE_PERF){
+    var key=new THREE.PointLight(0xd6e4ff, 2.2, 6, 2);
+    key.position.set(0.5, 0.4, 0.5);
+    G.camera.add(key);
+    G.vmLight=key;
+  }
 
   setGunModel('smg');   // default until player picks
 }
@@ -1703,6 +1726,7 @@ function killEnemy(e, headshot){
   spawnParticles(center, e.parts.torso.material.color.getHex(), 22, 5);
   G.scene.remove(e.mesh);
   e.hbCtx=null;
+  if(e.hbTex) e.hbTex.dispose();   // one canvas texture per enemy — free it
   var idx = G.enemies.indexOf(e);
   if(idx>=0) G.enemies.splice(idx,1);
 
@@ -2181,6 +2205,8 @@ function equipWeapon(kind){
   G.fireCooldown = 0.3;      // brief ready delay on swap
   setGunModel(kind);
   $('gunName').textContent = def.name;
+  $('reloadTip').style.display='none';   // a full mag: no "press R" left over
+  $('reloadBarWrap').style.display='none';
   updateHUD();
 }
 
@@ -2273,8 +2299,11 @@ function gameOverNow(){
   $('finalWave').textContent=G.wave;
   $('finalKills').textContent=G.kills;
   $('finalTime').textContent=Math.floor(G.timeAlive/60)+':'+String(Math.floor(G.timeAlive%60)).padStart(2,'0');
-  $('gameOverScreen').style.display='none';
-  $('weaponSelectScreen').style.display='flex';
+  // the death summary — this used to be written here and then immediately
+  // hidden, so the player never saw their run results
+  $('gameOverScreen').style.display='flex';
+  $('weaponSelectScreen').style.display='none';
+  $('hud').style.display='none';
 }
 
 // ---- touch / mobile controls -----------------------------------------
@@ -2493,6 +2522,21 @@ function setupInput(){
     if(ev.code==='Space') ev.preventDefault();
     if(ev.code==='ControlLeft'||ev.code==='ControlRight') ev.preventDefault();
     if(ev.code==='KeyR') startReload();
+    // keyboard pause: pointer lock normally delivers this for free (the browser
+    // releases the lock on Escape), but if the lock was never granted there was
+    // no way to pause at all
+    if(ev.code==='Escape'||ev.code==='KeyP'){
+      if(!G.started || G.gameOver) return;
+      if(!G.paused){
+        G.paused=true; G.mouseDown=false; G.aiming=false;
+        $('pauseScreen').style.display='flex';
+        if(document.pointerLockElement){ try{ document.exitPointerLock(); }catch(e){} }
+      } else {
+        G.paused=false;
+        $('pauseScreen').style.display='none';
+        lockPointer();
+      }
+    }
   });
   document.addEventListener('keyup',function(ev){ G.keys[ev.code]=false; });
 
@@ -2574,8 +2618,10 @@ function setupInput(){
     equipWeapon(kind);
     // reset run state
     G.started=true;
+    G.paused=false; G.mouseDown=false; G.aiming=false; G.sliding=false;
     document.getElementById('startScreen').style.display='none';
     document.getElementById('mpLobbyScreen').style.display='none';
+    document.getElementById('gameOverScreen').style.display='none';
     G.health=100; G.stamina=100; G.stamExhausted=false;
     G.score=0; G.kills=0; G.wave=1; G.waveBreak=3; G.timeAlive=0;
     G.gameOver=false; G.paused=false; G.damageFlash=0; G.hitMarkerTime=0;
@@ -2583,6 +2629,7 @@ function setupInput(){
     $('waveBanner').style.opacity=1;
     $('damageVignette').style.opacity=0;
     for(var i=G.enemies.length-1;i>=0;i--){
+      if(G.enemies[i].hbTex) G.enemies[i].hbTex.dispose();
       G.scene.remove(G.enemies[i].mesh);
     }
     G.enemies.length=0;
@@ -2593,6 +2640,7 @@ function setupInput(){
     G.playerX=0; G.playerZ=20; G.eyeY=EYE_HEIGHT; G.groundY=0;
     G.yawObj.rotation.y=0; G.pitchObj.rotation.x=0;
     $('weaponSelectScreen').style.display='none';
+    $('pauseScreen').style.display='none';
     $('hud').style.display='block';
     updateHUD();
     lockPointer();
@@ -2680,6 +2728,18 @@ function setupInput(){
     if(MP.mode==='host'){ mpHostStart(); }
   });
 
+  // ---- death summary buttons (solo) ----
+  var goRe=document.getElementById('goRedeployBtn');
+  if(goRe) goRe.addEventListener('click',function(){
+    AudioSys.resume();
+    document.getElementById('gameOverScreen').style.display='none';
+    document.getElementById('weaponSelectScreen').style.display='flex';
+  });
+  var goMenu=document.getElementById('goMenuBtn');
+  if(goMenu) goMenu.addEventListener('click',function(){ backToMenu(); });
+  var pauseMenu=document.getElementById('pauseMenuBtn');
+  if(pauseMenu) pauseMenu.addEventListener('click',function(){ backToMenu(); });
+
   // deep link: index.html?room=ABCDE opens the lobby with the code filled in
   try{
     var qs=new URLSearchParams(location.search);
@@ -2720,9 +2780,37 @@ function updateTraffic(dt){
 }
 
 var crosshairSpread = 0;
+// The four ticks are built once here — the #crosshair div ships empty, so
+// without this the player simply has no aiming reticle at all.
+var _chLines = null;
+function buildCrosshair(){
+  var root=$('crosshair');
+  if(!root || _chLines) return;
+  while(root.firstChild) root.removeChild(root.firstChild);
+  var dot=document.createElement('div'); dot.className='dot'; root.appendChild(dot);
+  function mk(cls,w,h){
+    var l=document.createElement('div');
+    l.className='l '+cls;
+    l.style.width=w+'px'; l.style.height=h+'px';
+    l.style.marginLeft=(-w/2)+'px'; l.style.marginTop=(-h/2)+'px';
+    root.appendChild(l);
+    return l;
+  }
+  _chLines={ up:mk('up',2,9), down:mk('down',2,9), left:mk('left',9,2), right:mk('right',9,2) };
+}
+function paintCrosshair(){
+  if(!_chLines) return;
+  // 4px clear of the centre dot + half a tick, then the live spread
+  var g = 8.5 + crosshairSpread;
+  _chLines.up.style.transform   = 'translateY('+(-g)+'px)';
+  _chLines.down.style.transform = 'translateY('+( g)+'px)';
+  _chLines.left.style.transform = 'translateX('+(-g)+'px)';
+  _chLines.right.style.transform= 'translateX('+( g)+'px)';
+}
 function updateCrosshair(dt){
   var target = G.mouseDown && G.fireCooldown>0 ? 14 : (G.keys['ShiftLeft']?10:5);
   crosshairSpread += (target-crosshairSpread)*Math.min(1,dt*12);
+  paintCrosshair();
 
   var isSniper = G.W && G.W.sound==='sniper';
   var scopeOn = G.aiming && isSniper && !G.reloading;
@@ -2745,6 +2833,9 @@ function updateCrosshair(dt){
       $('aimRing').style.opacity=0;
     }
   }
+  // the hip-fire ticks would double up on the ADS dot / scope crosshair
+  var ch=$('crosshair');
+  if(ch) ch.classList.toggle('hide', G.aiming);
 }
 
 var _mmAcc = 0;
@@ -2789,7 +2880,14 @@ function animate(){
   } else if(G.mouseDown && G.ammo===0 && !G.reloading && G.reserveAmmo>0){
     startReload();
   }
-  if(G.ammo===0 && !G.reloading) $('reloadTip').style.display='block';
+  if(G.ammo===0 && !G.reloading){
+    var rtip=$('reloadTip');
+    rtip.textContent = G.reserveAmmo>0 ? (IS_TOUCH?'MAG EMPTY — TAP RELOAD':'PRESS R TO RELOAD')
+                                       : 'OUT OF AMMO';
+    rtip.style.display='block';
+  } else if(G.reloading || G.ammo>0){
+    $('reloadTip').style.display='none';
+  }
 
   var isClient = (MP.mode==='client');
   var isSolo = (MP.mode==='solo');
@@ -2921,6 +3019,8 @@ function init(){
 
   setupInput();
   if(detectTouch()) enableTouchMode();
+  buildCrosshair();
+  paintCrosshair();
   updateHUD();
   $('waveBanner').style.opacity=1;
 
@@ -3468,9 +3568,10 @@ function backToMenu(){
   MP.peer=null; MP.hostConn=null; MP.conns=[]; MP.joined=false; MP.rejoining=false;
   for(var id in remotePlayers) removeRemotePlayer(parseInt(id));
   MP.players={}; MP.mode='solo'; MP.roomCode='';
-  G.started=false;
+  G.started=false; G.gameOver=false; G.paused=false; G.mouseDown=false; G.aiming=false;
   document.getElementById('hud').style.display='none';
   document.getElementById('pauseScreen').style.display='none';
+  document.getElementById('gameOverScreen').style.display='none';
   document.getElementById('mpLobbyScreen').style.display='none';
   document.getElementById('weaponSelectScreen').style.display='none';
   document.getElementById('startScreen').style.display='flex';
